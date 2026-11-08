@@ -11,4 +11,5 @@ pub mod config;
 pub mod discord;
 pub mod reminders;
 pub mod storage;
+pub mod ticker;
 pub mod tools;

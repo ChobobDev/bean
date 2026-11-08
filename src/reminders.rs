@@ -15,7 +15,7 @@ use serenity::all::{ChannelId, CreateAllowedMentions, CreateMessage, Http, UserI
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
-use crate::storage;
+use crate::{storage, ticker};
 
 /// Longest delay a reminder can have.
 pub const MAX_DELAY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -104,11 +104,16 @@ impl Reminders {
         if self.http.set(http).is_err() {
             return;
         }
-        let pending = self.state.lock().expect("reminders lock").pending.clone();
-        info!(count = pending.len(), "scheduling saved reminders");
-        for reminder in pending {
-            self.schedule(reminder);
-        }
+        let pending = self.state.lock().expect("reminders lock").pending.len();
+        info!(
+            count = pending,
+            "delivering saved reminders as they come due"
+        );
+        let this = Arc::clone(self);
+        ticker::spawn(&self.runtime, move || {
+            let this = Arc::clone(&this);
+            async move { this.deliver_due().await }
+        });
     }
 
     /// Creates a reminder for `user_id` in `channel_id`, `delay` from now.
@@ -156,10 +161,6 @@ impl Reminders {
             }
             reminder
         };
-
-        if self.http.get().is_some() {
-            self.schedule(reminder.clone());
-        }
         Ok(reminder)
     }
 
@@ -176,13 +177,14 @@ impl Reminders {
         reminders
     }
 
-    fn schedule(self: &Arc<Self>, reminder: Reminder) {
-        let this = Arc::clone(self);
-        self.runtime.spawn(async move {
-            let wait = reminder.due_at.saturating_sub(unix_now());
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            this.deliver(&reminder).await;
-        });
+    async fn deliver_due(&self) {
+        let due = due(
+            &self.state.lock().expect("reminders lock").pending,
+            unix_now(),
+        );
+        for reminder in due {
+            self.deliver(&reminder).await;
+        }
     }
 
     async fn deliver(&self, reminder: &Reminder) {
@@ -215,6 +217,17 @@ impl Reminders {
             warn!("failed to save reminders: {e}");
         }
     }
+}
+
+/// The reminders in `pending` that are due at `now`, oldest first.
+fn due(pending: &[Reminder], now: u64) -> Vec<Reminder> {
+    let mut due: Vec<_> = pending
+        .iter()
+        .filter(|r| r.due_at <= now)
+        .cloned()
+        .collect();
+    due.sort_by_key(|r| r.due_at);
+    due
 }
 
 pub fn unix_now() -> u64 {
@@ -303,6 +316,21 @@ mod tests {
         );
         // Other users aren't affected.
         assert!(reminders.add(1, 2, HOUR, "fine").is_ok());
+    }
+
+    #[test]
+    fn picks_due_reminders_oldest_first() {
+        let reminder = |id, due_at| Reminder {
+            id,
+            channel_id: 1,
+            user_id: 1,
+            due_at,
+            text: "x".into(),
+        };
+        let pending = [reminder(1, 300), reminder(2, 100), reminder(3, 900)];
+        let ids: Vec<_> = due(&pending, 300).iter().map(|r| r.id).collect();
+        assert_eq!(ids, [2, 1]);
+        assert!(due(&pending, 50).is_empty());
     }
 
     #[test]
