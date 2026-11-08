@@ -1,0 +1,9 @@
+[package]
+name = "bean"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fm-rs = "0.3.0"
+serenity = "0.12.5"
+tokio = { version = "1.54.1", features = ["full"] }
