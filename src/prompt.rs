@@ -1,0 +1,79 @@
+//! Turning Discord messages into prompts, and model errors into replies.
+
+use fm_rs::Error as FmError;
+
+/// Strips mentions of the bot (as a user or via one of its roles) from
+/// `content` and trims the result.
+pub fn clean_prompt(content: &str, bot_id: u64, bot_roles: &[u64]) -> String {
+    let mut text = content
+        .replace(&format!("<@{bot_id}>"), "")
+        .replace(&format!("<@!{bot_id}>"), "");
+    for role in bot_roles {
+        text = text.replace(&format!("<@&{role}>"), "");
+    }
+    text.trim().to_string()
+}
+
+/// Builds the prompt sent to the model. In shared channels the speaker's
+/// name is included so the model can tell people apart.
+pub fn build_prompt(author: &str, text: &str, shared_channel: bool) -> String {
+    if shared_channel {
+        format!("{author}: {text}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// A short, human-readable explanation of a model error.
+pub fn user_facing_error(error: &FmError) -> String {
+    match error {
+        FmError::AppleIntelligenceNotEnabled => {
+            "Apple Intelligence is turned off on the Mac running me.".into()
+        }
+        FmError::DeviceNotEligible | FmError::ModelNotAvailable => {
+            "The Mac running me can't use Apple Intelligence.".into()
+        }
+        FmError::ModelNotReady | FmError::AssetsUnavailable(_) => {
+            "My model is still getting ready. Try again in a minute.".into()
+        }
+        FmError::GuardrailViolation(_) => "Apple's safety filter blocked that one.".into(),
+        FmError::Refusal(_) => "I can't help with that.".into(),
+        FmError::ContextSizeExceeded(_) => "That message is too long for me.".into(),
+        FmError::UnsupportedLanguageOrLocale(_) => "I can't respond in that language yet.".into(),
+        FmError::RateLimited(_) => "I'm overloaded right now. Try again shortly.".into(),
+        other => format!("Something went wrong: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_user_and_nickname_mentions() {
+        assert_eq!(clean_prompt("<@42> hi there", 42, &[]), "hi there");
+        assert_eq!(clean_prompt("hey <@!42>", 42, &[]), "hey");
+    }
+
+    #[test]
+    fn strips_bot_role_mentions_only() {
+        let text = clean_prompt("<@&7> ask <@&8> about it", 42, &[7]);
+        assert_eq!(text, "ask <@&8> about it");
+    }
+
+    #[test]
+    fn keeps_other_users_mentions() {
+        assert_eq!(clean_prompt("<@42> say hi to <@99>", 42, &[]), "say hi to <@99>");
+    }
+
+    #[test]
+    fn mention_only_message_is_empty() {
+        assert_eq!(clean_prompt("  <@42>  ", 42, &[]), "");
+    }
+
+    #[test]
+    fn names_speaker_in_shared_channels() {
+        assert_eq!(build_prompt("ada", "hello", true), "ada: hello");
+        assert_eq!(build_prompt("ada", "hello", false), "hello");
+    }
+}
