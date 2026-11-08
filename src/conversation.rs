@@ -9,6 +9,11 @@
 //! turn we estimate how full it is; when the next prompt would not fit, the
 //! transcript is summarized and the conversation continues from a fresh
 //! session seeded with that summary.
+//!
+//! Every session is created with the channel's tools. Restoring a saved
+//! transcript directly would drop them, so a restored conversation is
+//! replayed into a new session's instructions instead (see
+//! [`crate::transcript`]).
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,10 +23,13 @@ use std::sync::{Arc, Mutex};
 
 use fm_rs::{
     CompactionConfig, ContextLimit, Error as FmError, GenerationOptions, Session,
-    SystemLanguageModel, compact_transcript, estimate_tokens, session_from_summary,
+    SystemLanguageModel, compact_transcript, compacted_instructions, estimate_tokens,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+use crate::tools::{ChannelTools, DiscordChannel, Toolkit};
+use crate::transcript;
 
 /// Upper bound on the length of a single reply.
 pub const MAX_RESPONSE_TOKENS: u32 = 500;
@@ -72,15 +80,28 @@ impl Engine {
     pub fn context_limit(&self) -> &ContextLimit {
         &self.limit
     }
+
+    fn new_session(&self, tools: &ChannelTools, instructions: Option<&str>) -> fm_rs::Result<Session> {
+        let mut builder = Session::builder(&self.model);
+        if let Some(instructions) = instructions {
+            builder = builder.instructions(instructions);
+        }
+        for tool in tools.tools() {
+            builder = builder.tool(Arc::clone(tool));
+        }
+        builder.build()
+    }
 }
 
-/// What happened to memory while producing a reply.
-#[derive(Debug, Default, Clone, Copy)]
+/// What happened while producing a reply, besides the text itself.
+#[derive(Debug, Default, Clone)]
 pub struct Outcome {
     /// Older history was summarized to make room.
     pub compacted: bool,
     /// Summarizing failed, so the conversation was restarted from scratch.
     pub memory_lost: bool,
+    /// A short description of each tool call, in order.
+    pub tools_used: Vec<String>,
 }
 
 /// Snapshot of how much of the context window a conversation uses.
@@ -104,21 +125,39 @@ pub struct Conversation {
     path: PathBuf,
     session: Option<Session>,
     compactions: u32,
+    tools: ChannelTools,
 }
 
 impl Conversation {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, tools: ChannelTools) -> Self {
         Self {
             path,
             session: None,
             compactions: 0,
+            tools,
         }
     }
 
-    /// Sends `prompt` and streams the reply to `on_chunk` as it is
-    /// generated. Returns the full reply. Blocks; call it from a blocking
-    /// thread.
+    /// Sends `prompt` from `author_id` and streams the reply to `on_chunk`
+    /// as it is generated. Returns the full reply. Blocks; call it from a
+    /// blocking thread.
     pub fn respond<F>(
+        &mut self,
+        engine: &Engine,
+        author_id: Option<u64>,
+        prompt: &str,
+        on_chunk: F,
+    ) -> fm_rs::Result<(String, Outcome)>
+    where
+        F: FnMut(&str) + Send,
+    {
+        self.tools.begin_turn(author_id);
+        let result = self.respond_inner(engine, prompt, on_chunk);
+        let tools_used = self.tools.finish_turn();
+        result.map(|(text, outcome)| (text, Outcome { tools_used, ..outcome }))
+    }
+
+    fn respond_inner<F>(
         &mut self,
         engine: &Engine,
         prompt: &str,
@@ -135,7 +174,7 @@ impl Conversation {
         }
 
         let mut text = String::new();
-        let mut result = self.stream(engine, prompt, &mut text, &mut on_chunk);
+        let mut result = stream(self.session(), prompt, &engine.options, &mut text, &mut on_chunk);
         // Token counts are estimates, so the model may still reject the
         // prompt. If nothing was shown yet, compact once and retry rather
         // than failing the turn.
@@ -144,7 +183,16 @@ impl Conversation {
             && !(outcome.compacted || outcome.memory_lost)
         {
             self.compact(engine, &mut outcome)?;
-            result = self.stream(engine, prompt, &mut text, &mut on_chunk);
+            result = stream(self.session(), prompt, &engine.options, &mut text, &mut on_chunk);
+        }
+        // The model sometimes calls a tool that doesn't exist, which fails
+        // the whole turn. Answer without tools instead.
+        if let Err(e) = &result
+            && text.is_empty()
+            && is_tool_bridge_error(e)
+        {
+            warn!(path = %self.path.display(), "tool call failed, retrying without tools: {e}");
+            result = self.answer_without_tools(engine, prompt, &mut text, &mut on_chunk);
         }
 
         if let Err(e) = self.save() {
@@ -153,8 +201,12 @@ impl Conversation {
         result.map(|()| (text, outcome))
     }
 
-    fn stream<F>(
-        &self,
+    /// Answers `prompt` in a temporary session that has no tools, then
+    /// carries the conversation (including this turn) back into a session
+    /// that does. `ToolCallingMode::Disallowed` would be simpler, but it
+    /// needs the macOS 27 SDK.
+    fn answer_without_tools<F>(
+        &mut self,
         engine: &Engine,
         prompt: &str,
         text: &mut String,
@@ -163,10 +215,16 @@ impl Conversation {
     where
         F: FnMut(&str) + Send,
     {
-        self.session().stream_response(prompt, &engine.options, |chunk| {
-            text.push_str(chunk);
-            on_chunk(chunk);
-        })
+        let history = transcript::restored_instructions(&self.session().transcript_json()?);
+        let plain = match &history {
+            Some(history) => Session::with_instructions(&engine.model, history)?,
+            None => Session::new(&engine.model)?,
+        };
+        let result = stream(&plain, prompt, &engine.options, text, on_chunk);
+
+        let history = transcript::restored_instructions(&plain.transcript_json()?);
+        self.session = Some(engine.new_session(&self.tools, history.as_deref())?);
+        result
     }
 
     /// Forgets the conversation, including its saved transcript.
@@ -200,20 +258,11 @@ impl Conversation {
         if self.session.is_some() {
             return Ok(());
         }
-        let restored = read_saved(&self.path).and_then(|saved| {
-            match Session::from_transcript(&engine.model, &saved.transcript) {
-                Ok(session) => Some((session, saved.compactions)),
-                Err(e) => {
-                    warn!(path = %self.path.display(), "discarding unreadable transcript: {e}");
-                    None
-                }
-            }
-        });
-        let (session, compactions) = match restored {
-            Some(restored) => restored,
-            None => (Session::new(&engine.model)?, 0),
+        let (instructions, compactions) = match read_saved(&self.path) {
+            Some(saved) => (transcript::restored_instructions(&saved.transcript), saved.compactions),
+            None => (None, 0),
         };
-        self.session = Some(session);
+        self.session = Some(engine.new_session(&self.tools, instructions.as_deref())?);
         self.compactions = compactions;
         Ok(())
     }
@@ -229,7 +278,10 @@ impl Conversation {
     fn compact(&mut self, engine: &Engine, outcome: &mut Outcome) -> fm_rs::Result<()> {
         let transcript = self.session().transcript_json()?;
         let compacted = compact_transcript(&engine.model, &transcript, &engine.compaction)
-            .and_then(|summary| session_from_summary(&engine.model, None, &summary));
+            .and_then(|summary| {
+                let instructions = compacted_instructions(None, &summary);
+                engine.new_session(&self.tools, instructions.as_deref())
+            });
 
         match compacted {
             Ok(session) => {
@@ -240,7 +292,7 @@ impl Conversation {
             }
             Err(e) => {
                 warn!(path = %self.path.display(), "compaction failed, starting fresh: {e}");
-                self.session = Some(Session::new(&engine.model)?);
+                self.session = Some(engine.new_session(&self.tools, None)?);
                 self.compactions = 0;
                 outcome.memory_lost = true;
             }
@@ -262,6 +314,29 @@ impl Conversation {
         fs::write(&tmp, serde_json::to_vec(&saved)?)?;
         fs::rename(tmp, &self.path)
     }
+}
+
+fn stream<F>(
+    session: &Session,
+    prompt: &str,
+    options: &GenerationOptions,
+    text: &mut String,
+    on_chunk: &mut F,
+) -> fm_rs::Result<()>
+where
+    F: FnMut(&str) + Send,
+{
+    session.stream_response(prompt, options, |chunk| {
+        text.push_str(chunk);
+        on_chunk(chunk);
+    })
+}
+
+/// Whether `error` came from the tool bridge rather than the model itself,
+/// e.g. the model calling a tool that doesn't exist. Our own tools never
+/// return errors, so this is the only way a tool call fails a turn.
+fn is_tool_bridge_error(error: &FmError) -> bool {
+    matches!(error, FmError::GenerationError(message) if message.contains("invoking the tool"))
 }
 
 fn read_saved(path: &Path) -> Option<SavedConversation> {
@@ -289,16 +364,18 @@ fn read_saved(path: &Path) -> Option<SavedConversation> {
 /// Hands out one [`Conversation`] per channel, creating them on demand.
 pub struct ConversationStore {
     engine: Arc<Engine>,
+    toolkit: Toolkit,
     dir: PathBuf,
     conversations: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<Conversation>>>>,
 }
 
 impl ConversationStore {
-    pub fn open(engine: Engine, dir: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn open(engine: Engine, toolkit: Toolkit, dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         Ok(Self {
             engine: Arc::new(engine),
+            toolkit,
             dir,
             conversations: Mutex::new(HashMap::new()),
         })
@@ -310,11 +387,19 @@ impl ConversationStore {
 
     /// Returns the conversation for `channel_id`. Messages in the same
     /// channel queue up on its lock and are answered in order.
-    pub fn conversation(&self, channel_id: u64) -> Arc<tokio::sync::Mutex<Conversation>> {
+    ///
+    /// `discord` gives the conversation's tools access to the channel. It's
+    /// only used the first time a channel is seen.
+    pub fn conversation(
+        &self,
+        channel_id: u64,
+        discord: Option<DiscordChannel>,
+    ) -> Arc<tokio::sync::Mutex<Conversation>> {
         let mut conversations = self.conversations.lock().expect("store lock poisoned");
         let conversation = conversations.entry(channel_id).or_insert_with(|| {
             let path = self.dir.join(format!("{channel_id}.json"));
-            Arc::new(tokio::sync::Mutex::new(Conversation::new(path)))
+            let tools = self.toolkit.channel_tools(discord);
+            Arc::new(tokio::sync::Mutex::new(Conversation::new(path, tools)))
         });
         Arc::clone(conversation)
     }
@@ -339,10 +424,23 @@ mod tests {
         engine
     }
 
+    /// Tools call `Handle::block_on` from a dispatch thread, so the runtime
+    /// must drive its own timers and IO: a multi-threaded one.
+    fn runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+    }
+
+    fn open_store(engine: Engine, dir: &Path) -> ConversationStore {
+        let handle = runtime().handle().clone();
+        let reminders = crate::reminders::Reminders::open(dir.join("reminders.json"), handle.clone()).unwrap();
+        ConversationStore::open(engine, Toolkit::new(handle, reminders), dir).unwrap()
+    }
+
     fn ask(store: &ConversationStore, channel: u64, prompt: &str) -> (String, Outcome) {
-        let conversation = store.conversation(channel);
+        let conversation = store.conversation(channel, None);
         let mut conversation = conversation.try_lock().expect("uncontended");
-        conversation.respond(&store.engine(), prompt, |_| {}).expect("response")
+        conversation.respond(&store.engine(), Some(42), prompt, |_| {}).expect("response")
     }
 
     #[test]
@@ -350,11 +448,11 @@ mod tests {
     fn remembers_across_turns_and_restarts() {
         let dir = temp_dir("restart");
 
-        let store = ConversationStore::open(engine(), &dir).unwrap();
+        let store = open_store(engine(), &dir);
         ask(&store, 1, "Remember this: my cat is named Biscuit. Just reply OK.");
         drop(store);
 
-        let store = ConversationStore::open(engine(), &dir).unwrap();
+        let store = open_store(engine(), &dir);
         let (reply, _) = ask(&store, 1, "What is my cat's name? Answer with just the name.");
         assert!(reply.to_lowercase().contains("biscuit"), "reply was {reply:?}");
 
@@ -368,13 +466,13 @@ mod tests {
     #[ignore = "requires Apple Intelligence"]
     fn streams_reply_in_chunks() {
         let dir = temp_dir("stream");
-        let store = ConversationStore::open(engine(), &dir).unwrap();
-        let conversation = store.conversation(1);
+        let store = open_store(engine(), &dir);
+        let conversation = store.conversation(1, None);
         let mut conversation = conversation.try_lock().unwrap();
 
         let mut chunks = Vec::new();
         let (text, _) = conversation
-            .respond(&store.engine(), "Write three sentences about the sea.", |chunk| {
+            .respond(&store.engine(), None, "Write three sentences about the sea.", |chunk| {
                 chunks.push(chunk.to_owned());
             })
             .unwrap();
@@ -387,11 +485,84 @@ mod tests {
 
     #[test]
     #[ignore = "requires Apple Intelligence"]
+    fn calls_tools_and_keeps_them_after_restart() {
+        let dir = temp_dir("tools");
+
+        let store = open_store(engine(), &dir);
+        let (reply, outcome) = ask(&store, 1, "What is today's date?");
+        assert_eq!(outcome.tools_used, ["Checked the time"], "reply was {reply:?}");
+        drop(store);
+
+        // A restored conversation must still be able to call tools.
+        let store = open_store(engine(), &dir);
+        let (reply, outcome) = ask(&store, 1, "What's the weather like in Seoul right now?");
+        assert_eq!(outcome.tools_used, ["Checked the weather in Seoul"], "reply was {reply:?}");
+        assert!(reply.contains('°'), "reply was {reply:?}");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Apple Intelligence"]
+    fn answering_without_tools_keeps_memory_and_tools() {
+        let dir = temp_dir("no-tools");
+        let store = open_store(engine(), &dir);
+        ask(&store, 1, "Remember this: my cat is named Biscuit. Just reply OK.");
+
+        let reply = {
+            let conversation = store.conversation(1, None);
+            let mut conversation = conversation.try_lock().unwrap();
+            let mut text = String::new();
+            conversation
+                .answer_without_tools(&store.engine(), "What is my cat's name?", &mut text, &mut |_| {})
+                .unwrap();
+            text
+        };
+        assert!(reply.to_lowercase().contains("biscuit"), "reply was {reply:?}");
+
+        let (reply, outcome) = ask(&store, 1, "What is today's date?");
+        assert_eq!(outcome.tools_used, ["Checked the time"], "reply was {reply:?}");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Apple Intelligence"]
+    fn sets_reminders_for_the_speaker() {
+        let dir = temp_dir("reminder");
+        let handle = runtime().handle().clone();
+        let reminders = crate::reminders::Reminders::open(dir.join("reminders.json"), handle.clone()).unwrap();
+        let store = ConversationStore::open(engine(), Toolkit::new(handle, Arc::clone(&reminders)), &dir).unwrap();
+        // The reminder tool doesn't touch Discord until delivery, so a
+        // client that never connects is enough.
+        let discord = DiscordChannel {
+            http: Arc::new(serenity::all::Http::new("")),
+            channel_id: serenity::all::ChannelId::new(5),
+            guild_id: None,
+        };
+        let conversation = store.conversation(5, Some(discord));
+        let mut conversation = conversation.try_lock().unwrap();
+        let (reply, outcome) = conversation
+            .respond(&store.engine(), Some(42), "Remind me in 2 hours to stretch.", |_| {})
+            .unwrap();
+
+        let pending = reminders.pending_for(42);
+        assert_eq!(pending.len(), 1, "reply was {reply:?}, tools {:?}", outcome.tools_used);
+        assert!(pending[0].text.to_lowercase().contains("stretch"), "{pending:?}");
+        let delay = pending[0].due_at - crate::reminders::unix_now();
+        assert!((110 * 60..=120 * 60).contains(&delay), "due in {delay}s");
+        assert_eq!(pending[0].channel_id, 5);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Apple Intelligence"]
     fn compacts_when_context_fills_up() {
         let dir = temp_dir("compact");
         let model = SystemLanguageModel::new().unwrap();
         let tiny = ContextLimit::new(500).with_reserved_response_tokens(100);
-        let store = ConversationStore::open(Engine::with_limit(model, tiny), &dir).unwrap();
+        let store = open_store(Engine::with_limit(model, tiny), &dir);
 
         ask(&store, 1, "My name is Juniper and I live in Lisbon. Reply OK.");
         let mut compacted = false;
@@ -402,7 +573,7 @@ mod tests {
         assert!(compacted, "expected the tiny context to force a compaction");
 
         let status = {
-            let conversation = store.conversation(1);
+            let conversation = store.conversation(1, None);
             let mut conversation = conversation.try_lock().unwrap();
             conversation.status(&store.engine()).unwrap()
         };
@@ -415,11 +586,11 @@ mod tests {
     #[ignore = "requires Apple Intelligence"]
     fn reset_forgets_everything() {
         let dir = temp_dir("reset");
-        let store = ConversationStore::open(engine(), &dir).unwrap();
+        let store = open_store(engine(), &dir);
         ask(&store, 1, "Remember the code word: PELICAN. Reply OK.");
         assert!(dir.join("1.json").exists());
 
-        store.conversation(1).try_lock().unwrap().reset().unwrap();
+        store.conversation(1, None).try_lock().unwrap().reset().unwrap();
         assert!(!dir.join("1.json").exists());
 
         let (reply, _) = ask(&store, 1, "What was the code word? If you don't know, say UNKNOWN.");
