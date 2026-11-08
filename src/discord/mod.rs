@@ -9,4 +9,4 @@ mod mentions;
 mod pages;
 mod reply;
 
-pub use handler::Handler;
+pub use handler::{Handler, Services};

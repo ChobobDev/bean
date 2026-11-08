@@ -5,13 +5,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serenity::Client;
 use serenity::all::GatewayIntents;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::ai::{ConversationStore, Engine};
 use crate::config::Config;
-use crate::discord::Handler;
+use crate::daily::Daily;
+use crate::discord::{Handler, Services};
 use crate::reminders::Reminders;
-use crate::tools::Toolkit;
+use crate::spotify::Spotify;
+use crate::tools::{Toolkit, web_client};
 
 /// Message Content is a privileged intent; enable it in the Developer
 /// Portal or Discord refuses the connection.
@@ -27,14 +29,36 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let runtime = tokio::runtime::Handle::current();
+    let web = web_client();
+    let spotify = config
+        .spotify
+        .clone()
+        .map(|credentials| Arc::new(Spotify::new(credentials, web.clone())));
+    match &spotify {
+        Some(_) => info!("Spotify is set up; song recommendations are on"),
+        None => info!("Spotify isn't set up; song recommendations are off"),
+    }
+
     let reminders = Reminders::open(config.reminders_path(), runtime.clone())
         .context("failed to load reminders")?;
-    let toolkit = Toolkit::new(runtime, Arc::clone(&reminders));
+    let toolkit = Toolkit::new(
+        runtime.clone(),
+        web.clone(),
+        Arc::clone(&reminders),
+        spotify.clone(),
+    );
     let store = ConversationStore::open(engine, toolkit, config.conversations_dir())
         .context("failed to create the conversations directory")?;
+    let daily = Daily::open(config.daily_path(), runtime, web, spotify, store.engine())
+        .context("failed to load the daily post schedule")?;
 
+    let services = Services {
+        store: Arc::new(store),
+        reminders,
+        daily,
+    };
     let mut client = Client::builder(&config.discord_token, INTENTS)
-        .event_handler(Handler::new(Arc::new(store), reminders))
+        .event_handler(Handler::new(services))
         .await
         .context("failed to create the Discord client")?;
     client

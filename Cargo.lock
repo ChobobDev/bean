@@ -83,6 +83,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "chrono-tz",
+ "fastrand",
  "fm-rs",
  "reqwest",
  "serde",

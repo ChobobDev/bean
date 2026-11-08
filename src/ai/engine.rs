@@ -52,6 +52,12 @@ impl Engine {
         &self.limit
     }
 
+    /// Answers a single prompt, with no memory and no tools. Blocks.
+    pub fn ask_once(&self, prompt: &str) -> fm_rs::Result<String> {
+        let session = self.session_without_tools(None)?;
+        Ok(session.respond(prompt, &self.options)?.into_content())
+    }
+
     /// A session that can call `tools`.
     pub(super) fn session_with_tools(
         &self,

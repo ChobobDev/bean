@@ -8,8 +8,10 @@
 pub mod ai;
 pub mod app;
 pub mod config;
+pub mod daily;
 pub mod discord;
 pub mod reminders;
+pub mod spotify;
 pub mod storage;
 pub mod ticker;
 pub mod tools;

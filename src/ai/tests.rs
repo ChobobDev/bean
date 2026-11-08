@@ -9,7 +9,7 @@ use fm_rs::{ContextLimit, SystemLanguageModel};
 
 use super::{ConversationStore, Engine, Outcome};
 use crate::reminders::{Reminders, unix_now};
-use crate::tools::{DiscordChannel, Toolkit};
+use crate::tools::{DiscordChannel, Toolkit, web_client};
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bean-test-{name}-{}", std::process::id()));
@@ -35,7 +35,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 fn open_store(engine: Engine, dir: &Path) -> ConversationStore {
     let handle = runtime().handle().clone();
     let reminders = Reminders::open(dir.join("reminders.json"), handle.clone()).unwrap();
-    ConversationStore::open(engine, Toolkit::new(handle, reminders), dir).unwrap()
+    let toolkit = Toolkit::new(handle, web_client(), reminders, None);
+    ConversationStore::open(engine, toolkit, dir).unwrap()
 }
 
 fn ask(store: &ConversationStore, channel: u64, prompt: &str) -> (String, Outcome) {
@@ -185,9 +186,8 @@ fn sets_reminders_for_the_speaker() {
     let dir = temp_dir("reminder");
     let handle = runtime().handle().clone();
     let reminders = Reminders::open(dir.join("reminders.json"), handle.clone()).unwrap();
-    let store =
-        ConversationStore::open(engine(), Toolkit::new(handle, Arc::clone(&reminders)), &dir)
-            .unwrap();
+    let toolkit = Toolkit::new(handle, web_client(), Arc::clone(&reminders), None);
+    let store = ConversationStore::open(engine(), toolkit, &dir).unwrap();
     // The reminder tool doesn't touch Discord until delivery, so a
     // client that never connects is enough.
     let discord = DiscordChannel {
@@ -314,3 +314,4 @@ fn converts_currency() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
