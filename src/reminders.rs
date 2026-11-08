@@ -15,6 +15,8 @@ use serenity::all::{ChannelId, CreateAllowedMentions, CreateMessage, Http, UserI
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
+use crate::storage;
+
 /// Longest delay a reminder can have.
 pub const MAX_DELAY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Most reminders a single user can have pending at once.
@@ -80,12 +82,12 @@ impl Reminders {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let state = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        let state = match storage::read_json(&path) {
+            Ok(state) => state.unwrap_or_default(),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 warn!(path = %path.display(), "ignoring corrupt reminders file: {e}");
                 State::default()
-            }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => State::default(),
+            }
             Err(e) => return Err(e),
         };
         Ok(Arc::new(Self {
@@ -130,7 +132,13 @@ impl Reminders {
 
         let reminder = {
             let mut state = self.state.lock().expect("reminders lock");
-            if state.pending.iter().filter(|r| r.user_id == user_id).count() >= MAX_PER_USER {
+            if state
+                .pending
+                .iter()
+                .filter(|r| r.user_id == user_id)
+                .count()
+                >= MAX_PER_USER
+            {
                 return Err(ReminderError::TooManyPending);
             }
             state.next_id += 1;
@@ -142,7 +150,7 @@ impl Reminders {
                 text,
             };
             state.pending.push(reminder.clone());
-            if let Err(e) = self.save(&state) {
+            if let Err(e) = storage::write_json(&self.path, &*state) {
                 state.pending.pop();
                 return Err(ReminderError::Storage(e.to_string()));
             }
@@ -158,8 +166,12 @@ impl Reminders {
     /// Pending reminders for `user_id`, soonest first.
     pub fn pending_for(&self, user_id: u64) -> Vec<Reminder> {
         let state = self.state.lock().expect("reminders lock");
-        let mut reminders: Vec<_> =
-            state.pending.iter().filter(|r| r.user_id == user_id).cloned().collect();
+        let mut reminders: Vec<_> = state
+            .pending
+            .iter()
+            .filter(|r| r.user_id == user_id)
+            .cloned()
+            .collect();
         reminders.sort_by_key(|r| r.due_at);
         reminders
     }
@@ -182,24 +194,26 @@ impl Reminders {
         }
         // Ping the person who asked, and nobody else.
         let mentions = CreateAllowedMentions::new().users([UserId::new(reminder.user_id)]);
-        let message = CreateMessage::new().content(content).allowed_mentions(mentions);
-        if let Err(e) = ChannelId::new(reminder.channel_id).send_message(http, message).await {
+        let message = CreateMessage::new()
+            .content(content)
+            .allowed_mentions(mentions);
+        if let Err(e) = ChannelId::new(reminder.channel_id)
+            .send_message(http, message)
+            .await
+        {
             // Usually the channel is gone or Bean lost access. Retrying
             // wouldn't help, so drop it.
-            warn!(id = reminder.id, "failed to deliver reminder, dropping it: {e}");
+            warn!(
+                id = reminder.id,
+                "failed to deliver reminder, dropping it: {e}"
+            );
         }
 
         let mut state = self.state.lock().expect("reminders lock");
         state.pending.retain(|r| r.id != reminder.id);
-        if let Err(e) = self.save(&state) {
+        if let Err(e) = storage::write_json(&self.path, &*state) {
             warn!("failed to save reminders: {e}");
         }
-    }
-
-    fn save(&self, state: &State) -> io::Result<()> {
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_vec(state)?)?;
-        fs::rename(tmp, &self.path)
     }
 }
 
@@ -214,13 +228,17 @@ mod tests {
     use super::*;
 
     fn temp_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bean-reminders-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bean-reminders-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir.join("reminders.json")
     }
 
     fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     const HOUR: Duration = Duration::from_secs(3600);
@@ -243,8 +261,14 @@ mod tests {
     fn ids_stay_unique_after_reopen() {
         let rt = runtime();
         let path = temp_path("ids");
-        let first = Reminders::open(&path, rt.handle().clone()).unwrap().add(1, 1, HOUR, "a").unwrap();
-        let second = Reminders::open(&path, rt.handle().clone()).unwrap().add(1, 1, HOUR, "b").unwrap();
+        let first = Reminders::open(&path, rt.handle().clone())
+            .unwrap()
+            .add(1, 1, HOUR, "a")
+            .unwrap();
+        let second = Reminders::open(&path, rt.handle().clone())
+            .unwrap()
+            .add(1, 1, HOUR, "b")
+            .unwrap();
         assert_ne!(first.id, second.id);
     }
 
@@ -252,9 +276,18 @@ mod tests {
     fn rejects_out_of_range_delays_and_empty_text() {
         let rt = runtime();
         let reminders = Reminders::open(temp_path("limits"), rt.handle().clone()).unwrap();
-        assert_eq!(reminders.add(1, 1, Duration::from_secs(5), "x"), Err(ReminderError::TooSoon));
-        assert_eq!(reminders.add(1, 1, MAX_DELAY + HOUR, "x"), Err(ReminderError::TooFar));
-        assert_eq!(reminders.add(1, 1, HOUR, "   "), Err(ReminderError::EmptyText));
+        assert_eq!(
+            reminders.add(1, 1, Duration::from_secs(5), "x"),
+            Err(ReminderError::TooSoon)
+        );
+        assert_eq!(
+            reminders.add(1, 1, MAX_DELAY + HOUR, "x"),
+            Err(ReminderError::TooFar)
+        );
+        assert_eq!(
+            reminders.add(1, 1, HOUR, "   "),
+            Err(ReminderError::EmptyText)
+        );
     }
 
     #[test]
@@ -264,7 +297,10 @@ mod tests {
         for i in 0..MAX_PER_USER {
             reminders.add(1, 1, HOUR, &format!("r{i}")).unwrap();
         }
-        assert_eq!(reminders.add(1, 1, HOUR, "one more"), Err(ReminderError::TooManyPending));
+        assert_eq!(
+            reminders.add(1, 1, HOUR, "one more"),
+            Err(ReminderError::TooManyPending)
+        );
         // Other users aren't affected.
         assert!(reminders.add(1, 2, HOUR, "fine").is_ok());
     }

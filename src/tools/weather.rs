@@ -1,55 +1,35 @@
 //! Current weather from Open-Meteo, which needs no API key.
 
-use fm_rs::{Tool, ToolOutput};
 use serde::Deserialize;
-use serde_json::{Value, json};
 
-use super::{Shared, arg_str, failure, output};
+use super::{Args, BeanTool, Param, ToolContext, ToolError, ToolResult};
 
-pub struct Weather {
-    shared: Shared,
-    web: reqwest::Client,
-}
+pub struct Weather;
 
-impl Weather {
-    pub(super) fn new(shared: Shared, web: reqwest::Client) -> Self {
-        Self { shared, web }
-    }
-}
-
-impl Tool for Weather {
-    fn name(&self) -> &str {
+impl BeanTool for Weather {
+    fn name(&self) -> &'static str {
         "getWeather"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Returns the current weather for a city: temperature, conditions, humidity, and wind. \
          Use it whenever someone asks about the weather or temperature somewhere."
     }
 
-    fn arguments_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "city": { "type": "string", "description": "City name, e.g. 'Seoul' or 'Paris'" }
-            }
-        })
+    fn params(&self) -> &'static [Param] {
+        const PARAMS: &[Param] = &[Param::text("city", "City name, e.g. 'Seoul' or 'Paris'")];
+        PARAMS
     }
 
-    fn call(&self, arguments: Value) -> fm_rs::Result<ToolOutput> {
-        let Some(city) = arg_str(&arguments, "city") else {
-            return failure("missing the \"city\" argument");
-        };
+    fn run(&self, args: &Args, ctx: &ToolContext) -> ToolResult {
+        let city = args.require_text("city")?;
         // The geocoder matches names only, so drop any ", Country" suffix.
-        let city = city.split(',').next().unwrap_or(city).trim().to_string();
-        self.shared.record(format!("Checked the weather in {city}"));
+        let city = city.split(',').next().unwrap_or(city).trim();
+        ctx.record(format!("Checked the weather in {city}"));
 
-        match self.shared.block_on(lookup(&self.web, &city)) {
-            Ok(Ok(Some(report))) => output(report),
-            Ok(Ok(None)) => failure(format!("couldn't find a city called {city}")),
-            Ok(Err(e)) => failure(format!("the weather service failed: {e}")),
-            Err(e) => failure(e),
-        }
+        ctx.block_on(lookup(ctx.web(), city))?
+            .map_err(|e| ToolError::new(format!("the weather service failed: {e}")))?
+            .ok_or_else(|| ToolError::new(format!("couldn't find a city called {city}")))
     }
 }
 

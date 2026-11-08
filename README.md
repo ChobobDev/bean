@@ -5,7 +5,7 @@ A Discord chat bot powered by Apple's on-device [Foundation Models](https://deve
 ## Features
 
 - **Conversation memory.** Each channel (and DM) has its own conversation. Bean remembers what was said and who said it, and the memory survives restarts.
-- **Automatic summarizing.** The on-device model has a small context window (~4k tokens). When a conversation gets too long, Bean summarizes the older part and carries on from the summary.
+- **Automatic summarizing.** The on-device model has a small context window (8k tokens on macOS 27, 4k before). When a conversation gets too long, Bean summarizes the older part and carries on from the summary.
 - **Streaming replies.** Bean posts its reply as soon as it starts writing and fills it in as the model generates. Long replies continue across messages without breaking code blocks.
 - **Tools.** Bean can take actions while answering (see below). Each reply notes which tools it used.
 - **Slash commands.** `/reset` makes Bean forget the current channel. `/memory` shows how full that channel's memory is.
@@ -59,17 +59,56 @@ The ignored tests need Apple Intelligence available on the machine running them.
 
 ## Layout
 
-| File | Responsibility |
-|---|---|
-| `src/main.rs` | Startup and configuration |
-| `src/handler.rs` | Discord events: messages and slash commands |
-| `src/conversation.rs` | Per-channel sessions, persistence, and summarizing |
-| `src/reply.rs` | Streaming a reply into Discord messages |
-| `src/pages.rs` | Splitting long text into message-sized pages |
-| `src/prompt.rs` | Mention handling and user-facing error messages |
-| `src/transcript.rs` | Rendering saved conversations for restoring them with tools |
-| `src/tools/` | The tools the model can call |
-| `src/reminders.rs` | Saving, scheduling, and delivering reminders |
+```
+src/
+├── main.rs          logging, then app::run
+├── app.rs           builds the engine, tools, and Discord client
+├── config.rs        environment variables
+├── storage.rs       JSON files with atomic writes
+├── reminders.rs     saving, scheduling, and delivering reminders
+├── ai/              the model
+│   ├── engine.rs        model, context budget, and session creation
+│   ├── conversation.rs  one channel's memory: turns, summarizing, fallbacks
+│   ├── store.rs         one conversation per channel
+│   ├── transcript.rs    restoring saved conversations with tools
+│   └── tests.rs         tests against the real model
+├── discord/         Discord
+│   ├── handler.rs       routes events
+│   ├── chat.rs          deciding what to answer, and streaming the answer
+│   ├── commands.rs      slash commands
+│   ├── reply.rs         a reply that fills in as it streams
+│   ├── pages.rs         splitting long replies across messages
+│   ├── mentions.rs      turning messages into prompts
+│   └── errors.rs        explaining model errors
+└── tools/           what the model can do
+    ├── tool.rs          the BeanTool trait and its adapter to fm-rs
+    ├── args.rs          reading (and recovering) tool arguments
+    ├── context.rs       what a tool can access
+    └── <one file per tool>
+```
+
+## Adding a tool
+
+Write a unit struct that implements `BeanTool`, then add it to `TOOLS` in `src/tools/mod.rs`:
+
+```rust
+pub struct Coin;
+
+impl BeanTool for Coin {
+    fn name(&self) -> &'static str { "flipCoin" }
+
+    fn description(&self) -> &'static str {
+        "Flips a coin. Use it when someone asks you to flip a coin or decide between two things."
+    }
+
+    fn run(&self, _args: &Args, ctx: &ToolContext) -> ToolResult {
+        ctx.record("Flipped a coin");
+        Ok(if rand::random() { "Heads" } else { "Tails" }.into())
+    }
+}
+```
+
+The schema, argument recovery, logging, and error handling are shared. Declare arguments with `params()` and read them with `args.text(..)`, `args.integer(..)`, or `args.duration(..)`. Return `Err(ToolError::new(..))` for problems the model should explain. Override `available()` if the tool needs a Discord channel. Every tool costs roughly 50–115 tokens of context on every turn, so keep descriptions short.
 
 ## Notes on the on-device model
 

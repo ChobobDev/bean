@@ -29,7 +29,10 @@ pub fn restored_instructions(transcript_json: &str) -> Option<String> {
         return None;
     }
     // Don't stack headers when a restored conversation is restored again.
-    let body = text.strip_prefix(RESTORED_HEADER).unwrap_or(text).trim_start();
+    let body = text
+        .strip_prefix(RESTORED_HEADER)
+        .unwrap_or(text)
+        .trim_start();
     Some(format!("{RESTORED_HEADER}\n{body}"))
 }
 
@@ -135,7 +138,11 @@ mod tests {
             "Earlier conversation:\\nConversation summary:",
         );
         let instructions = restored_instructions(&restored).unwrap();
-        assert_eq!(instructions.matches(RESTORED_HEADER).count(), 1, "{instructions}");
+        assert_eq!(
+            instructions.matches(RESTORED_HEADER).count(),
+            1,
+            "{instructions}"
+        );
     }
 
     #[test]

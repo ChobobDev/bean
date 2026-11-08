@@ -109,7 +109,10 @@ mod tests {
     fn splits_on_line_breaks() {
         let text = "first line here\nsecond line here\nthird line here";
         let pages = split_pages(text, 40);
-        assert_eq!(pages, vec!["first line here\nsecond line here", "third line here"]);
+        assert_eq!(
+            pages,
+            vec!["first line here\nsecond line here", "third line here"]
+        );
     }
 
     #[test]
@@ -144,7 +147,10 @@ mod tests {
         assert_fits(&pages, 120);
         assert!(pages.len() > 1);
         for page in &pages {
-            let fences = page.lines().filter(|l| l.trim_start().starts_with("```")).count();
+            let fences = page
+                .lines()
+                .filter(|l| l.trim_start().starts_with("```"))
+                .count();
             assert_eq!(fences % 2, 0, "unbalanced fences in {page:?}");
         }
         assert!(pages[1].starts_with("```rust\n"));
