@@ -70,6 +70,7 @@ pub struct Param {
 pub enum ParamKind {
     Text,
     Integer,
+    Number,
 }
 
 impl Param {
@@ -77,6 +78,14 @@ impl Param {
         Self {
             name,
             kind: ParamKind::Text,
+            description,
+        }
+    }
+
+    pub const fn number(name: &'static str, description: &'static str) -> Self {
+        Self {
+            name,
+            kind: ParamKind::Number,
             description,
         }
     }
@@ -104,6 +113,7 @@ pub(super) fn schema(params: &[Param]) -> Value {
             let kind = match param.kind {
                 ParamKind::Text => "string",
                 ParamKind::Integer => "integer",
+                ParamKind::Number => "number",
             };
             let property = json!({ "type": kind, "description": param.description });
             (param.name.to_string(), property)

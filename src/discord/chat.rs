@@ -72,7 +72,7 @@ impl Handler {
             .await;
         let (generation, mut chunks) = generate(
             conversation,
-            self.store.engine(),
+            self.services.store.engine(),
             msg.author.id.get(),
             prompt,
         );
@@ -138,10 +138,10 @@ fn generate(
     (generation, chunks)
 }
 
-/// Small print shown under a reply: which tools ran, and what happened to
-/// memory.
+/// What goes under a reply: links the tools attached, then small print
+/// about which tools ran and what happened to memory.
 fn notes(outcome: &Outcome) -> Vec<String> {
-    let mut notes = Vec::new();
+    let mut notes = outcome.attachments.clone();
     if !outcome.tools_used.is_empty() {
         notes.push(format!("-# 🔧 {}", outcome.tools_used.join(" · ")));
     }
@@ -174,6 +174,22 @@ mod tests {
         assert_eq!(
             notes(&outcome),
             ["-# 🔧 Checked the time · Checked the weather in Seoul"]
+        );
+    }
+
+    #[test]
+    fn attached_links_come_before_the_small_print() {
+        let outcome = Outcome {
+            tools_used: vec!["Found a jazz song on Spotify".into()],
+            attachments: vec!["https://open.spotify.com/track/abc".into()],
+            ..Outcome::default()
+        };
+        assert_eq!(
+            notes(&outcome),
+            [
+                "https://open.spotify.com/track/abc",
+                "-# 🔧 Found a jazz song on Spotify"
+            ]
         );
     }
 

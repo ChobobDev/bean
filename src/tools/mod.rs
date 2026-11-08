@@ -6,9 +6,12 @@
 
 mod args;
 mod context;
+mod currency;
+mod geo;
 mod messages;
 mod reminder;
 mod server;
+mod song;
 mod time;
 mod tool;
 mod weather;
@@ -18,39 +21,53 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 
 pub use args::{Args, parse_duration};
-pub use context::{DiscordChannel, ToolContext};
+pub use context::{DiscordChannel, ToolContext, TurnReport};
 pub use tool::{BeanTool, Param, ParamKind, ToolError, ToolResult};
 
 use crate::reminders::Reminders;
+use crate::spotify::Spotify;
 
 /// Every tool Bean has. Each channel gets the ones available to it.
 static TOOLS: &[&dyn BeanTool] = &[
     &time::CurrentTime,
     &weather::Weather,
+    &currency::ConvertCurrency,
+    &song::RecommendSong,
     &messages::RecentMessages,
     &server::ServerInfo,
     &reminder::SetReminder,
     &reminder::ListReminders,
 ];
 
+/// The HTTP client for outside services, shared so connections are reused.
+pub fn web_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(context::TOOL_TIMEOUT)
+        .user_agent(concat!("bean-discord-bot/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("HTTP client config is valid")
+}
+
 /// Services shared by every channel's tools.
 pub struct Toolkit {
     runtime: Handle,
     web: reqwest::Client,
     reminders: Arc<Reminders>,
+    spotify: Option<Arc<Spotify>>,
 }
 
 impl Toolkit {
-    pub fn new(runtime: Handle, reminders: Arc<Reminders>) -> Self {
-        let web = reqwest::Client::builder()
-            .timeout(context::TOOL_TIMEOUT)
-            .user_agent(concat!("bean-discord-bot/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("HTTP client config is valid");
+    pub fn new(
+        runtime: Handle,
+        web: reqwest::Client,
+        reminders: Arc<Reminders>,
+        spotify: Option<Arc<Spotify>>,
+    ) -> Self {
         Self {
             runtime,
             web,
             reminders,
+            spotify,
         }
     }
 
@@ -61,6 +78,7 @@ impl Toolkit {
             self.runtime.clone(),
             self.web.clone(),
             Arc::clone(&self.reminders),
+            self.spotify.clone(),
             discord,
         ));
         let tools = TOOLS
@@ -91,8 +109,8 @@ impl ChannelTools {
         self.ctx.begin_turn(author_id);
     }
 
-    /// Returns a short description of each tool call made this turn.
-    pub fn finish_turn(&self) -> Vec<String> {
+    /// Reports what the tools did this turn.
+    pub fn finish_turn(&self) -> TurnReport {
         self.ctx.finish_turn()
     }
 }
@@ -116,10 +134,10 @@ mod tests {
             .unwrap();
         let dir = std::env::temp_dir().join(format!("bean-toolkit-{}", std::process::id()));
         let reminders = Reminders::open(dir.join("r.json"), runtime.handle().clone()).unwrap();
-        let toolkit = Toolkit::new(runtime.handle().clone(), reminders);
+        let toolkit = Toolkit::new(runtime.handle().clone(), web_client(), reminders, None);
 
         let tools = toolkit.channel_tools(None);
         let names: Vec<_> = tools.tools().iter().map(|t| t.name().to_string()).collect();
-        assert_eq!(names, ["getCurrentTime", "getWeather"]);
+        assert_eq!(names, ["getCurrentTime", "getWeather", "convertCurrency"]);
     }
 }

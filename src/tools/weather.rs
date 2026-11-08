@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+use super::geo::{self, Place};
 use super::{Args, BeanTool, Param, ToolContext, ToolError, ToolResult};
 
 pub struct Weather;
@@ -22,29 +23,13 @@ impl BeanTool for Weather {
     }
 
     fn run(&self, args: &Args, ctx: &ToolContext) -> ToolResult {
-        let city = args.require_text("city")?;
-        // The geocoder matches names only, so drop any ", Country" suffix.
-        let city = city.split(',').next().unwrap_or(city).trim();
+        let city = geo::place_name(args.require_text("city")?);
         ctx.record(format!("Checked the weather in {city}"));
 
         ctx.block_on(lookup(ctx.web(), city))?
             .map_err(|e| ToolError::new(format!("the weather service failed: {e}")))?
             .ok_or_else(|| ToolError::new(format!("couldn't find a city called {city}")))
     }
-}
-
-#[derive(Deserialize)]
-struct Geocoding {
-    #[serde(default)]
-    results: Vec<Place>,
-}
-
-#[derive(Deserialize)]
-struct Place {
-    name: String,
-    country: Option<String>,
-    latitude: f64,
-    longitude: f64,
 }
 
 #[derive(Deserialize)]
@@ -62,15 +47,7 @@ struct Current {
 }
 
 async fn lookup(web: &reqwest::Client, city: &str) -> reqwest::Result<Option<String>> {
-    let geocoding: Geocoding = web
-        .get("https://geocoding-api.open-meteo.com/v1/search")
-        .query(&[("name", city), ("count", "1")])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let Some(place) = geocoding.results.into_iter().next() else {
+    let Some(place) = geo::find_place(web, city).await? else {
         return Ok(None);
     };
 
@@ -91,20 +68,20 @@ async fn lookup(web: &reqwest::Client, city: &str) -> reqwest::Result<Option<Str
         .json()
         .await?;
 
-    let now = forecast.current;
-    let location = match place.country {
-        Some(country) => format!("{}, {country}", place.name),
-        None => place.name,
-    };
-    Ok(Some(format!(
-        "{location}: {}, {:.0}°C ({:.0}°F), feels like {:.0}°C. Humidity {:.0}%, wind {:.0} km/h.",
+    Ok(Some(report(&place, &forecast.current)))
+}
+
+fn report(place: &Place, now: &Current) -> String {
+    format!(
+        "{}: {}, {:.0}°C ({:.0}°F), feels like {:.0}°C. Humidity {:.0}%, wind {:.0} km/h.",
+        place.label(),
         describe(now.weather_code),
         now.temperature_2m,
         now.temperature_2m * 9.0 / 5.0 + 32.0,
         now.apparent_temperature,
         now.relative_humidity_2m,
         now.wind_speed_10m,
-    )))
+    )
 }
 
 /// WMO weather interpretation codes, as used by Open-Meteo.

@@ -7,6 +7,7 @@ use tokio::runtime::Handle;
 
 use super::ToolError;
 use crate::reminders::Reminders;
+use crate::spotify::Spotify;
 
 /// Longest a single tool call may wait on the network.
 pub(super) const TOOL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -24,6 +25,7 @@ pub struct ToolContext {
     runtime: Handle,
     web: reqwest::Client,
     reminders: Arc<Reminders>,
+    spotify: Option<Arc<Spotify>>,
     discord: Option<DiscordChannel>,
     turn: Mutex<Turn>,
 }
@@ -31,7 +33,17 @@ pub struct ToolContext {
 #[derive(Default)]
 struct Turn {
     author_id: Option<u64>,
-    activity: Vec<String>,
+    report: TurnReport,
+}
+
+/// What the tools did during one turn.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TurnReport {
+    /// A short description of each tool call, in order.
+    pub activity: Vec<String>,
+    /// Links to post under the reply exactly as given (see
+    /// [`ToolContext::attach`]).
+    pub attachments: Vec<String>,
 }
 
 impl ToolContext {
@@ -39,15 +51,22 @@ impl ToolContext {
         runtime: Handle,
         web: reqwest::Client,
         reminders: Arc<Reminders>,
+        spotify: Option<Arc<Spotify>>,
         discord: Option<DiscordChannel>,
     ) -> Self {
         Self {
             runtime,
             web,
             reminders,
+            spotify,
             discord,
             turn: Mutex::default(),
         }
+    }
+
+    /// Spotify, if credentials are configured.
+    pub fn spotify(&self) -> Option<&Spotify> {
+        self.spotify.as_deref()
     }
 
     pub fn web(&self) -> &reqwest::Client {
@@ -77,7 +96,13 @@ impl ToolContext {
 
     /// Notes what a tool did, to show under the reply.
     pub fn record(&self, activity: impl Into<String>) {
-        self.lock_turn().activity.push(activity.into());
+        self.lock_turn().report.activity.push(activity.into());
+    }
+
+    /// Posts `link` under the reply exactly as given. The model may mangle
+    /// a URL it repeats, so links meant for the user go here instead.
+    pub fn attach(&self, link: impl Into<String>) {
+        self.lock_turn().report.attachments.push(link.into());
     }
 
     /// Runs `future` to completion from a tool's thread.
@@ -92,15 +117,14 @@ impl ToolContext {
     }
 
     pub(super) fn begin_turn(&self, author_id: Option<u64>) {
-        let mut turn = self.lock_turn();
-        turn.author_id = author_id;
-        turn.activity.clear();
+        *self.lock_turn() = Turn {
+            author_id,
+            report: TurnReport::default(),
+        };
     }
 
-    pub(super) fn finish_turn(&self) -> Vec<String> {
-        let mut turn = self.lock_turn();
-        turn.author_id = None;
-        std::mem::take(&mut turn.activity)
+    pub(super) fn finish_turn(&self) -> TurnReport {
+        std::mem::take(&mut *self.lock_turn()).report
     }
 
     fn lock_turn(&self) -> std::sync::MutexGuard<'_, Turn> {

@@ -40,6 +40,8 @@ pub struct Outcome {
     pub memory_lost: bool,
     /// A short description of each tool call, in order.
     pub tools_used: Vec<String>,
+    /// Links the tools want posted under the reply, exactly as given.
+    pub attachments: Vec<String>,
 }
 
 /// How much of the context window a conversation uses.
@@ -91,15 +93,14 @@ impl Conversation {
     {
         self.tools.begin_turn(author_id);
         let result = self.run_turn(engine, prompt, on_chunk);
-        let tools_used = self.tools.finish_turn();
+        let report = self.tools.finish_turn();
         result.map(|(text, outcome)| {
-            (
-                text,
-                Outcome {
-                    tools_used,
-                    ..outcome
-                },
-            )
+            let outcome = Outcome {
+                tools_used: report.activity,
+                attachments: report.attachments,
+                ..outcome
+            };
+            (text, outcome)
         })
     }
 

@@ -8,17 +8,24 @@ use tracing::info;
 
 use super::commands;
 use crate::ai::{Conversation, ConversationStore};
+use crate::daily::Daily;
 use crate::reminders::Reminders;
 use crate::tools::DiscordChannel;
 
+/// Everything the Discord side uses.
+pub struct Services {
+    pub store: Arc<ConversationStore>,
+    pub reminders: Arc<Reminders>,
+    pub daily: Arc<Daily>,
+}
+
 pub struct Handler {
-    pub(super) store: Arc<ConversationStore>,
-    pub(super) reminders: Arc<Reminders>,
+    pub(super) services: Services,
 }
 
 impl Handler {
-    pub fn new(store: Arc<ConversationStore>, reminders: Arc<Reminders>) -> Self {
-        Self { store, reminders }
+    pub fn new(services: Services) -> Self {
+        Self { services }
     }
 
     /// The conversation for a channel, with tools bound to that channel.
@@ -33,7 +40,9 @@ impl Handler {
             channel_id,
             guild_id,
         };
-        self.store.conversation(channel_id.get(), Some(discord))
+        self.services
+            .store
+            .conversation(channel_id.get(), Some(discord))
     }
 }
 
@@ -51,7 +60,8 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("{} is connected", ready.user.name);
-        self.reminders.start(Arc::clone(&ctx.http));
+        self.services.reminders.start(Arc::clone(&ctx.http));
+        self.services.daily.start(Arc::clone(&ctx.http));
         commands::register(&ctx).await;
     }
 }

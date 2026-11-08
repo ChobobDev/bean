@@ -8,7 +8,8 @@ A Discord chat bot powered by Apple's on-device [Foundation Models](https://deve
 - **Automatic summarizing.** The on-device model has a small context window (8k tokens on macOS 27, 4k before). When a conversation gets too long, Bean summarizes the older part and carries on from the summary.
 - **Streaming replies.** Bean posts its reply as soon as it starts writing and fills it in as the model generates. Long replies continue across messages without breaking code blocks.
 - **Tools.** Bean can take actions while answering (see below). Each reply notes which tools it used.
-- **Slash commands.** `/reset` makes Bean forget the current channel. `/memory` shows how full that channel's memory is.
+- **Morning quote and song.** `/daily start` posts a quote of the day and a song to match it every morning (see below).
+- **Slash commands.** `/reset` makes Bean forget the current channel. `/memory` shows how full that channel's memory is. `/daily` sets up the morning post.
 - **Safe output.** Replies can never ping `@everyone`, roles, or users.
 
 ## Tools
@@ -17,16 +18,43 @@ The model decides when to call these on its own:
 
 | Tool | What it does |
 |---|---|
-| `getCurrentTime` | The current date, time, and time zone (the model has no clock) |
+| `getCurrentTime` | The current date and time here, or in any city (the model has no clock) |
 | `readRecentMessages` | Reads up to 30 recent messages in the current channel, including ones not sent to Bean |
 | `getServerInfo` | The server's name, member and online counts, creation date, roles, and channels |
 | `setReminder` | Pings the person who asked, in the same channel, after a delay of up to 7 days |
 | `listReminders` | Lists the asker's pending reminders |
 | `getWeather` | Current weather for a city, from [Open-Meteo](https://open-meteo.com) (no API key) |
+| `convertCurrency` | Converts between 30 currencies with European Central Bank rates, via [Frankfurter](https://frankfurter.dev) (no API key) |
+| `recommendSong` | A random Spotify song in a genre, or one by a given artist. Bean posts the link itself, and Discord shows a player. Needs Spotify set up |
 
 Tools only see the channel and server they're used in. Reminders are saved to disk and survive restarts, and each user can have up to 10 pending. There's deliberately no general "fetch a URL" tool: anyone in your server could use it to make your Mac request local network addresses.
 
 Bean answers when it's @mentioned (as a user or via its role) in a server, and to every message in DMs.
+
+## Morning quote and song
+
+Run `/daily start` in a channel (or a DM with Bean) to get a post there every day:
+
+> ☀️ **Good morning!** Here's your quote for Monday, 9 November.
+> > Begin anywhere.
+> > — John Cage
+>
+> 🎵 **Today's song** (jazz): So What by Miles Davis
+
+The quote is [ZenQuotes](https://zenquotes.io)' quote of the day. The model picks a genre that suits the quote's mood, and Bean finds a random Spotify song in it.
+
+- `/daily start time:7:30am` picks the time (default 08:00, in this Mac's time zone). `/daily stop`, `/daily status`, and `/daily preview` do what they say.
+- In servers, only members who can manage channels can use `/daily`.
+- If the Mac is asleep or Bean is offline at post time, the post goes out when it's back, as long as that's within 6 hours.
+
+## Setting up Spotify
+
+Song recommendations are optional. To turn them on:
+
+1. Create an app at the [Spotify developer dashboard](https://developer.spotify.com/dashboard). Since February 2026, apps in Development Mode need the owner to have **Spotify Premium**.
+2. Set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` from the app's settings.
+
+Bean only uses search, through app-only authentication, so nobody has to sign in. Spotify no longer offers its recommendations API to new apps, so a "recommendation" is a random result from a `genre:` search.
 
 ## Requirements
 
@@ -43,10 +71,11 @@ DISCORD_TOKEN=your_token cargo run --release
 | Variable | Default | Purpose |
 |---|---|---|
 | `DISCORD_TOKEN` | required | Bot token from the Discord Developer Portal |
-| `BEAN_DATA_DIR` | `data` | Where conversations are saved |
+| `BEAN_DATA_DIR` | `data` | Where conversations, reminders, and the daily schedule are saved |
+| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | unset | Turn on song recommendations (set both, or neither) |
 | `RUST_LOG` | `bean=info,warn` | Log filter, e.g. `bean=debug` to log every message |
 
-Conversations are stored as plain JSON in `$BEAN_DATA_DIR/conversations/<channel id>.json`. Delete a file (or use `/reset`) to forget that channel. Pending reminders are in `$BEAN_DATA_DIR/reminders.json`.
+Conversations are stored as plain JSON in `$BEAN_DATA_DIR/conversations/<channel id>.json`. Delete a file (or use `/reset`) to forget that channel. Pending reminders are in `$BEAN_DATA_DIR/reminders.json`, and the daily post schedule is in `$BEAN_DATA_DIR/daily.json`.
 
 ## Testing
 
@@ -66,6 +95,9 @@ src/
 ├── config.rs        environment variables
 ├── storage.rs       JSON files with atomic writes
 ├── reminders.rs     saving, scheduling, and delivering reminders
+├── daily.rs         the morning quote and song
+├── spotify.rs       finding songs on Spotify
+├── ticker.rs        scheduling that survives the Mac sleeping
 ├── ai/              the model
 │   ├── engine.rs        model, context budget, and session creation
 │   ├── conversation.rs  one channel's memory: turns, summarizing, fallbacks
@@ -75,7 +107,7 @@ src/
 ├── discord/         Discord
 │   ├── handler.rs       routes events
 │   ├── chat.rs          deciding what to answer, and streaming the answer
-│   ├── commands.rs      slash commands
+│   ├── commands/        slash commands (/reset, /memory, /daily)
 │   ├── reply.rs         a reply that fills in as it streams
 │   ├── pages.rs         splitting long replies across messages
 │   ├── mentions.rs      turning messages into prompts
