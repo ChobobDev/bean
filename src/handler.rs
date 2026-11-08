@@ -4,17 +4,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serenity::all::{
-    Command, CommandInteraction, Context, CreateCommand, EditInteractionResponse, EventHandler,
-    Interaction, Message, Ready, Typing,
+    ChannelId, Command, CommandInteraction, Context, CreateCommand, EditInteractionResponse,
+    EventHandler, GuildId, Interaction, Message, Ready, Typing,
 };
 use serenity::async_trait;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
-use crate::conversation::ConversationStore;
+use crate::conversation::{Conversation, ConversationStore};
 use crate::prompt::{build_prompt, clean_prompt, user_facing_error};
+use crate::reminders::Reminders;
 use crate::reply::StreamingReply;
+use crate::tools::DiscordChannel;
 
 /// How often a streaming reply is edited. Discord allows roughly five
 /// edits per five seconds per channel.
@@ -22,11 +24,26 @@ const EDIT_INTERVAL: Duration = Duration::from_millis(1000);
 
 pub struct Handler {
     store: Arc<ConversationStore>,
+    reminders: Arc<Reminders>,
 }
 
 impl Handler {
-    pub fn new(store: Arc<ConversationStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<ConversationStore>, reminders: Arc<Reminders>) -> Self {
+        Self { store, reminders }
+    }
+
+    fn conversation(
+        &self,
+        ctx: &Context,
+        channel_id: ChannelId,
+        guild_id: Option<GuildId>,
+    ) -> Arc<tokio::sync::Mutex<Conversation>> {
+        let discord = DiscordChannel {
+            http: Arc::clone(&ctx.http),
+            channel_id,
+            guild_id,
+        };
+        self.store.conversation(channel_id.get(), Some(discord))
     }
 
     /// Answers `prompt` in `msg`'s channel, using that channel's memory.
@@ -36,12 +53,16 @@ impl Handler {
         let mut typing = Some(msg.channel_id.start_typing(&ctx.http));
 
         // Waits here if this channel is already being answered.
-        let conversation = self.store.conversation(msg.channel_id.get()).lock_owned().await;
+        let conversation = self
+            .conversation(ctx, msg.channel_id, msg.guild_id)
+            .lock_owned()
+            .await;
         let engine = self.store.engine();
+        let author_id = msg.author.id.get();
         let (chunks_tx, mut chunks) = mpsc::unbounded_channel::<String>();
         let generation = tokio::task::spawn_blocking(move || {
             let mut conversation = conversation;
-            conversation.respond(&engine, &prompt, move |chunk| {
+            conversation.respond(&engine, Some(author_id), &prompt, move |chunk| {
                 // The receiver only goes away if the handler task died.
                 let _ = chunks_tx.send(chunk.to_owned());
             })
@@ -71,6 +92,9 @@ impl Handler {
                 if reply.is_empty() {
                     reply.push_note("(no response)");
                 }
+                if !outcome.tools_used.is_empty() {
+                    reply.push_note(&format!("-# 🔧 {}", outcome.tools_used.join(" · ")));
+                }
                 if outcome.memory_lost {
                     reply.push_note("-# I ran out of memory and had to start this conversation over.");
                 } else if outcome.compacted {
@@ -98,7 +122,10 @@ impl Handler {
 
         // Taking the lock waits for any reply in progress, so a reset can't
         // be undone by a reply that finishes afterwards.
-        let conversation = self.store.conversation(command.channel_id.get()).lock_owned().await;
+        let conversation = self
+            .conversation(ctx, command.channel_id, command.guild_id)
+            .lock_owned()
+            .await;
         let engine = self.store.engine();
         let name = command.data.name.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -179,6 +206,7 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("{} is connected", ready.user.name);
+        self.reminders.start(Arc::clone(&ctx.http));
         let commands = vec![
             CreateCommand::new("reset").description("Make Bean forget this channel's conversation"),
             CreateCommand::new("memory").description("Show how much of Bean's memory this channel uses"),

@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use bean::conversation::{ConversationStore, Engine};
 use bean::handler::Handler;
+use bean::reminders::Reminders;
+use bean::tools::Toolkit;
 use serenity::Client;
 use serenity::all::GatewayIntents;
 use tracing::{error, warn};
@@ -22,14 +24,18 @@ async fn main() {
     if let Err(e) = engine.ensure_available() {
         warn!("model unavailable, replies will report errors: {e}");
     }
-    let store = ConversationStore::open(engine, format!("{data_dir}/conversations"))
+    let runtime = tokio::runtime::Handle::current();
+    let reminders = Reminders::open(format!("{data_dir}/reminders.json"), runtime.clone())
+        .expect("failed to load reminders");
+    let toolkit = Toolkit::new(runtime, Arc::clone(&reminders));
+    let store = ConversationStore::open(engine, toolkit, format!("{data_dir}/conversations"))
         .expect("failed to create data directory");
 
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler::new(Arc::new(store)))
+        .event_handler(Handler::new(Arc::new(store), reminders))
         .await
         .expect("failed to create client");
 
