@@ -7,7 +7,7 @@ use serenity::all::{
 };
 use tracing::warn;
 
-use crate::pages::split_pages;
+use super::pages::split_pages;
 
 /// Page size, kept below Discord's 2000 character limit for safety.
 const PAGE_CHARS: usize = 1900;
@@ -75,19 +75,26 @@ impl StreamingReply {
             let result = match self.sent.get_mut(i) {
                 Some((_, shown)) if *shown == page => continue,
                 Some((message, shown)) => {
-                    let edit = EditMessage::new().content(&page).allowed_mentions(no_pings());
+                    let edit = EditMessage::new()
+                        .content(&page)
+                        .allowed_mentions(no_pings());
                     let result = message.edit(&self.http, edit).await;
                     *shown = page;
                     result
                 }
                 None => {
-                    let mut create = CreateMessage::new().content(&page).allowed_mentions(no_pings());
+                    let mut create = CreateMessage::new()
+                        .content(&page)
+                        .allowed_mentions(no_pings());
                     if i == 0 {
                         create = create.reference_message(self.reply_to.clone());
                     }
-                    self.channel.send_message(&self.http, create).await.map(|message| {
-                        self.sent.push((message, page));
-                    })
+                    self.channel
+                        .send_message(&self.http, create)
+                        .await
+                        .map(|message| {
+                            self.sent.push((message, page));
+                        })
                 }
             };
             if let Err(e) = result {
