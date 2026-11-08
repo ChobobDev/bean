@@ -6,6 +6,8 @@
 
 mod args;
 mod context;
+mod currency;
+mod geo;
 mod messages;
 mod reminder;
 mod server;
@@ -27,6 +29,7 @@ use crate::reminders::Reminders;
 static TOOLS: &[&dyn BeanTool] = &[
     &time::CurrentTime,
     &weather::Weather,
+    &currency::ConvertCurrency,
     &messages::RecentMessages,
     &server::ServerInfo,
     &reminder::SetReminder,
@@ -120,6 +123,6 @@ mod tests {
 
         let tools = toolkit.channel_tools(None);
         let names: Vec<_> = tools.tools().iter().map(|t| t.name().to_string()).collect();
-        assert_eq!(names, ["getCurrentTime", "getWeather"]);
+        assert_eq!(names, ["getCurrentTime", "getWeather", "convertCurrency"]);
     }
 }

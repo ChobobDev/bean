@@ -41,6 +41,12 @@ impl<'a> Args<'a> {
         self.take(&[name], as_integer)
     }
 
+    /// A positive number, such as an amount of money. Accepts "1,500" and
+    /// "1500.50" as well as JSON numbers.
+    pub fn number(&self, name: &str) -> Option<f64> {
+        self.take(&[name], as_number)
+    }
+
     /// A length of time such as "2 hours" (see [`parse_duration`]). Since
     /// the model is especially loose with these, any of `names` is tried.
     pub fn duration(&self, names: &[&str]) -> Option<Duration> {
@@ -88,6 +94,15 @@ fn as_integer(value: &Value) -> Option<u64> {
                 .map(|f| f.round() as u64)
         })
         .or_else(|| value.as_str()?.trim().parse().ok())
+}
+
+fn as_number(value: &Value) -> Option<f64> {
+    let number = match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().replace(',', "").parse().ok(),
+        _ => None,
+    };
+    number.filter(|n| n.is_finite() && *n > 0.0)
 }
 
 fn as_duration(value: &Value) -> Option<Duration> {
@@ -155,6 +170,22 @@ mod tests {
         }
         let args = json!({ "n": -3, "m": "nope" });
         assert_eq!(Args::new(&args).integer("n"), None);
+    }
+
+    #[test]
+    fn reads_amounts() {
+        for (value, expected) in [
+            (json!(12.5), 12.5),
+            (json!("1,500"), 1500.0),
+            (json!(" 3 "), 3.0),
+        ] {
+            let args = json!({ "amount": value });
+            assert_eq!(Args::new(&args).number("amount"), Some(expected), "{value}");
+        }
+        for value in [json!(0), json!(-2), json!("lots")] {
+            let args = json!({ "amount": value });
+            assert_eq!(Args::new(&args).number("amount"), None, "{value}");
+        }
     }
 
     #[test]

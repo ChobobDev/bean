@@ -286,3 +286,31 @@ fn reset_forgets_everything() {
 
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+#[ignore = "requires Apple Intelligence"]
+fn tells_the_time_in_another_city() {
+    let dir = temp_dir("world-clock");
+    let store = open_store(engine(), &dir);
+    let (reply, outcome) = ask(&store, 1, "What time is it in New York right now?");
+    assert_eq!(
+        outcome.tools_used,
+        ["Checked the time in New York"],
+        "reply was {reply:?}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires Apple Intelligence"]
+fn converts_currency() {
+    let dir = temp_dir("currency");
+    let store = open_store(engine(), &dir);
+    let (reply, outcome) = ask(&store, 1, "How much is 100 US dollars in Korean won?");
+    assert_eq!(
+        outcome.tools_used,
+        ["Converted USD to KRW"],
+        "reply was {reply:?}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
