@@ -1,19 +1,24 @@
 //! Discord event handling: chat messages and slash commands.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serenity::all::{
-    Command, CommandInteraction, Context, CreateAllowedMentions, CreateCommand, CreateMessage,
-    EditInteractionResponse, EventHandler, Interaction, Message, Ready,
+    Command, CommandInteraction, Context, CreateCommand, EditInteractionResponse, EventHandler,
+    Interaction, Message, Ready, Typing,
 };
 use serenity::async_trait;
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use crate::conversation::ConversationStore;
 use crate::prompt::{build_prompt, clean_prompt, user_facing_error};
+use crate::reply::StreamingReply;
 
-/// Discord's hard limit on message length.
-const DISCORD_MESSAGE_LIMIT: usize = 2000;
+/// How often a streaming reply is edited. Discord allows roughly five
+/// edits per five seconds per channel.
+const EDIT_INTERVAL: Duration = Duration::from_millis(1000);
 
 pub struct Handler {
     store: Arc<ConversationStore>,
@@ -25,49 +30,64 @@ impl Handler {
     }
 
     /// Answers `prompt` in `msg`'s channel, using that channel's memory.
+    /// The reply is posted as soon as the model starts writing and edited
+    /// as more text arrives.
     async fn reply(&self, ctx: &Context, msg: &Message, prompt: String) {
-        let typing = msg.channel_id.start_typing(&ctx.http);
+        let mut typing = Some(msg.channel_id.start_typing(&ctx.http));
 
         // Waits here if this channel is already being answered.
         let conversation = self.store.conversation(msg.channel_id.get()).lock_owned().await;
         let engine = self.store.engine();
-        let result = tokio::task::spawn_blocking(move || {
+        let (chunks_tx, mut chunks) = mpsc::unbounded_channel::<String>();
+        let generation = tokio::task::spawn_blocking(move || {
             let mut conversation = conversation;
-            conversation.respond(&engine, &prompt)
-        })
-        .await;
-        typing.stop();
+            conversation.respond(&engine, &prompt, move |chunk| {
+                // The receiver only goes away if the handler task died.
+                let _ = chunks_tx.send(chunk.to_owned());
+            })
+        });
 
-        let mut text = match result {
-            Ok(Ok((text, outcome))) => {
-                let mut text = if text.trim().is_empty() { "(no response)".into() } else { text };
-                if outcome.memory_lost {
-                    text.push_str("\n-# I ran out of memory and had to start this conversation over.");
-                } else if outcome.compacted {
-                    text.push_str("\n-# Older messages were summarized to make room.");
+        let mut reply = StreamingReply::new(Arc::clone(&ctx.http), msg);
+        let mut tick = tokio::time::interval(EDIT_INTERVAL);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                chunk = chunks.recv() => match chunk {
+                    Some(chunk) => reply.push(&chunk),
+                    // The sender is dropped when generation ends.
+                    None => break,
+                },
+                _ = tick.tick() => {
+                    reply.flush().await;
+                    if reply.has_posted() {
+                        typing.take().map(Typing::stop);
+                    }
                 }
-                text
+            }
+        }
+
+        match generation.await {
+            Ok(Ok((_, outcome))) => {
+                if reply.is_empty() {
+                    reply.push_note("(no response)");
+                }
+                if outcome.memory_lost {
+                    reply.push_note("-# I ran out of memory and had to start this conversation over.");
+                } else if outcome.compacted {
+                    reply.push_note("-# Older messages were summarized to make room.");
+                }
             }
             Ok(Err(e)) => {
                 warn!("model error: {e}");
-                user_facing_error(&e)
+                reply.push_note(&format!("-# {}", user_facing_error(&e)));
             }
             Err(e) => {
                 error!("generation task failed: {e}");
-                "Something went wrong on my end.".into()
+                reply.push_note("-# Something went wrong on my end.");
             }
-        };
-        if text.chars().count() > DISCORD_MESSAGE_LIMIT {
-            text = text.chars().take(DISCORD_MESSAGE_LIMIT).collect();
         }
-
-        let message = CreateMessage::new()
-            .content(text)
-            .reference_message(msg)
-            .allowed_mentions(no_pings());
-        if let Err(e) = msg.channel_id.send_message(&ctx.http, message).await {
-            warn!("failed to send reply: {e}");
-        }
+        reply.flush().await;
+        typing.take().map(Typing::stop);
     }
 
     async fn run_command(&self, ctx: &Context, command: &CommandInteraction) {
@@ -116,12 +136,6 @@ impl Handler {
             warn!("failed to answer /{}: {e}", command.data.name);
         }
     }
-}
-
-/// Lets replies reference the user's message without pinging anyone, so
-/// model output can never trigger @everyone or role pings.
-fn no_pings() -> CreateAllowedMentions {
-    CreateAllowedMentions::new()
 }
 
 #[async_trait]

@@ -115,9 +115,18 @@ impl Conversation {
         }
     }
 
-    /// Sends `prompt` and returns the model's reply. Blocks; call it from
-    /// a blocking thread.
-    pub fn respond(&mut self, engine: &Engine, prompt: &str) -> fm_rs::Result<(String, Outcome)> {
+    /// Sends `prompt` and streams the reply to `on_chunk` as it is
+    /// generated. Returns the full reply. Blocks; call it from a blocking
+    /// thread.
+    pub fn respond<F>(
+        &mut self,
+        engine: &Engine,
+        prompt: &str,
+        mut on_chunk: F,
+    ) -> fm_rs::Result<(String, Outcome)>
+    where
+        F: FnMut(&str) + Send,
+    {
         self.ensure_loaded(engine)?;
         let mut outcome = Outcome::default();
 
@@ -125,20 +134,39 @@ impl Conversation {
             self.compact(engine, &mut outcome)?;
         }
 
-        let mut result = self.session().respond(prompt, &engine.options);
+        let mut text = String::new();
+        let mut result = self.stream(engine, prompt, &mut text, &mut on_chunk);
         // Token counts are estimates, so the model may still reject the
-        // prompt. Compact once and retry rather than failing the turn.
+        // prompt. If nothing was shown yet, compact once and retry rather
+        // than failing the turn.
         if matches!(result, Err(FmError::ContextSizeExceeded(_)))
+            && text.is_empty()
             && !(outcome.compacted || outcome.memory_lost)
         {
             self.compact(engine, &mut outcome)?;
-            result = self.session().respond(prompt, &engine.options);
+            result = self.stream(engine, prompt, &mut text, &mut on_chunk);
         }
 
         if let Err(e) = self.save() {
             warn!(path = %self.path.display(), "failed to save conversation: {e}");
         }
-        result.map(|response| (response.into_content(), outcome))
+        result.map(|()| (text, outcome))
+    }
+
+    fn stream<F>(
+        &self,
+        engine: &Engine,
+        prompt: &str,
+        text: &mut String,
+        on_chunk: &mut F,
+    ) -> fm_rs::Result<()>
+    where
+        F: FnMut(&str) + Send,
+    {
+        self.session().stream_response(prompt, &engine.options, |chunk| {
+            text.push_str(chunk);
+            on_chunk(chunk);
+        })
     }
 
     /// Forgets the conversation, including its saved transcript.
@@ -314,7 +342,7 @@ mod tests {
     fn ask(store: &ConversationStore, channel: u64, prompt: &str) -> (String, Outcome) {
         let conversation = store.conversation(channel);
         let mut conversation = conversation.try_lock().expect("uncontended");
-        conversation.respond(&store.engine(), prompt).expect("response")
+        conversation.respond(&store.engine(), prompt, |_| {}).expect("response")
     }
 
     #[test]
@@ -332,6 +360,27 @@ mod tests {
 
         let (reply, _) = ask(&store, 2, "What is my cat's name? If you don't know, say UNKNOWN.");
         assert!(!reply.to_lowercase().contains("biscuit"), "channels leaked: {reply:?}");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Apple Intelligence"]
+    fn streams_reply_in_chunks() {
+        let dir = temp_dir("stream");
+        let store = ConversationStore::open(engine(), &dir).unwrap();
+        let conversation = store.conversation(1);
+        let mut conversation = conversation.try_lock().unwrap();
+
+        let mut chunks = Vec::new();
+        let (text, _) = conversation
+            .respond(&store.engine(), "Write three sentences about the sea.", |chunk| {
+                chunks.push(chunk.to_owned());
+            })
+            .unwrap();
+
+        assert!(chunks.len() > 1, "expected incremental chunks, got {chunks:?}");
+        assert_eq!(chunks.concat(), text);
 
         fs::remove_dir_all(dir).unwrap();
     }
